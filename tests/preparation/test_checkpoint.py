@@ -15,7 +15,8 @@ import pytest
 from ignition.preparation import CheckpointError, inspect_qwen38_checkpoint
 from ignition.preparation import qwen38
 from ignition.preparation.checkpoint import (
-    _inspect_frontend_assets, _parse_json, _read_header, _validate_config, _validate_tensors,
+    _inspect_frontend_assets, _inspect_indexed_checkpoint, _parse_json, _read_header,
+    _validate_config, _validate_tensors,
 )
 
 
@@ -260,3 +261,26 @@ def test_inspection_accepts_semantically_identical_config(snapshot, tmp_path):
     (tmp_path / "config.json").write_text(json.dumps(config, sort_keys=True))
     manifest = inspect_qwen38_checkpoint(tmp_path)
     assert manifest.tensors["lm_head.weight"].shape == (248320, 2560)
+
+
+def test_trellismx_total_size_exception_covers_model_shards_only(tmp_path):
+    (tmp_path / "trellismx").mkdir()
+    (tmp_path / "trellismx" / "manifest.json").write_text("{}")
+    _write_header(tmp_path / "model-00001.safetensors",
+                  {"weight": {"dtype": "F32", "shape": [1], "data_offsets": [0, 4]}})
+    _write_header(tmp_path / "engram.safetensors",
+                  {"table": {"dtype": "F32", "shape": [2], "data_offsets": [0, 8]}}, b"\0" * 8)
+    index = {"metadata": {"total_size": 4},
+             "weight_map": {"weight": "model-00001.safetensors", "table": "engram.safetensors"}}
+
+    _inspect_indexed_checkpoint(tmp_path, index)
+
+    index["metadata"]["total_size"] = 6
+    with pytest.raises(CheckpointError, match="total_size does not match"):
+        _inspect_indexed_checkpoint(tmp_path, index)
+
+    # Without the pack marker the model-shard exception does not apply.
+    (tmp_path / "trellismx" / "manifest.json").unlink()
+    index["metadata"]["total_size"] = 4
+    with pytest.raises(CheckpointError, match="total_size does not match"):
+        _inspect_indexed_checkpoint(tmp_path, index)

@@ -598,7 +598,11 @@ def plan(recipe: Recipe, checkpoint: Checkpoint, gpus: tuple[Gpu, ...], *, selec
     if speculation is not None and speculation.vocabulary_parallel_sampling:
         if recipe.name != "deepseek41":
             raise UsageError("--vocabulary-parallel-sampling requires DeepSeek V4.1")
-        world_sizes = tuple(size for size in world_sizes if size != 3)
+        # The vocabulary gather needs the expert shards of four or more ranks;
+        # smaller TP layouts cannot supply the transition storage.
+        world_sizes = tuple(size for size in world_sizes if size >= 4)
+        if not world_sizes:
+            raise UsageError("--vocabulary-parallel-sampling requires at least four tensor-parallel ranks")
     sizes = " or ".join(map(str, world_sizes))
     supported = [gpu for gpu in gpus if gpu.supported]
     chosen = None
