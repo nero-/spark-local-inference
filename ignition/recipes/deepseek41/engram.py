@@ -2,16 +2,20 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
 # SPDX-License-Identifier: Apache-2.0
 
-"""File-backed FP8 n-gram tables, compact GPU inputs, and residual injection."""
+"""File-backed n-gram tables (FP8 or 4-bit trellis), compact GPU inputs, and residual injection."""
 
 from dataclasses import dataclass
 from functools import cached_property
+import json
+from pathlib import Path
+import struct
 
 import torch
 from b12x.norm import hyperconnection
 from b12x.preparation import PreparedCall
 from b12x.sequence import engram
 
+from ignition.components import engram_trellis
 from ignition.components.engram import EngramInputs, PreparedEngramLookup, PreparedEngramRequests
 from ignition.components.readiness import ReadinessTimings
 from ignition.components.embedding_partition import EmbeddingHeadPartition
@@ -22,6 +26,16 @@ from ignition.preparation.runtime_core import FileSource
 from ignition.preparation.persistent import persistent_copy
 from ignition.preparation.tuning import declare
 from ignition.progress import phase
+
+
+def _tensor_span(path, name):
+    """Byte span, shape and dtype of one tensor in a single-tensor safetensors file."""
+    with open(path, "rb") as source:
+        header_bytes = struct.unpack("<Q", source.read(8))[0]
+        header = json.loads(source.read(header_bytes))
+    record = header[name]
+    start, end = record["data_offsets"]
+    return 8 + header_bytes + start, end - start, tuple(record["shape"]), record["dtype"]
 
 
 @dataclass(frozen=True)
@@ -36,9 +50,11 @@ class Tables:
     row_mapping: dict
     columns: torch.Tensor
     readiness_runtime: object = None
+    trellis: bool = False
 
     @classmethod
-    def prepare(cls, manifest, config, *, tokens, device, sequence, frame, host_allocator, progress=None, shard=None):
+    def prepare(cls, manifest, config, *, tokens, device, sequence, frame, host_allocator, progress=None,
+                shard=None, root=None):
         from transformers import PreTrainedTokenizerFast
         from ignition.components.parallel import TensorParallelShard
 
@@ -53,34 +69,51 @@ class Tables:
             base_table_size=text["engram_vocab_size"], compressed_vocab_size=size)
         if geometry.num_embeddings != tuple(text["engram_num_embeddings"]):
             raise ValueError("Engram hash geometry differs from checkpoint tables")
+        # A multi-host peer stages indexed tensor ranges into a transfer cache;
+        # external Engram files live in the checkpoint directory.
+        root = Path(root) if root is not None else manifest.snapshot
+        if not (root / "engram").is_dir():
+            root = manifest.snapshot
         sources, inputs, mailboxes, row_mapping = {}, {}, {}, {}
         timings = ReadinessTimings.allocate(frame, len(geometry.layer_ids))
         with phase(progress, "Prepare embedding tables") as stage:
             for index, layer in enumerate(geometry.layer_ids):
                 rows = geometry.num_embeddings[index]
-                pair = []
-                for suffix, columns, dtype in (("weight", 256, "F8_E4M3"), ("scale", 8, "F8_E8M0")):
-                    name = f"layers.{layer}.engram.embed.{suffix}"
-                    metadata = manifest.tensors[name]
-                    if metadata.shape != (rows, columns) or metadata.dtype != dtype:
-                        raise ValueError(f"{name}: invalid Engram table geometry or dtype")
-                    pair.append(FileSource(manifest.snapshot / metadata.shard, metadata.offset, rows * columns))
-                sources[layer] = tuple(pair)
                 partition = EmbeddingHeadPartition.for_rank(geometry.offsets[index], rows,
                                                             shard.rank, shard.world_size)
                 row_mapping[layer] = torch.tensor(partition.row_mapping, dtype=torch.int64, device=device)
-                inputs[layer] = EngramInputs.allocate(tokens, device, timings=timings, interval=index)
+                if config.trellismx:
+                    trellis_path = root / f"engram/layer-{layer:03d}.trellis.safetensors"
+                    scale_path = root / f"engram/layer-{layer:03d}.scale.safetensors"
+                    pair = []
+                    for path, suffix, columns, dtype, width in (
+                            (trellis_path, "trellis", 128, "U8", 128),
+                            (scale_path, "scale", 8, "F8_E8M0", 8)):
+                        name = f"layers.{layer}.engram.embed.{suffix}"
+                        offset, nbytes, shape, actual = _tensor_span(path, name)
+                        if shape != (rows, columns) or actual != dtype or nbytes != rows * width:
+                            raise ValueError(f"{name}: invalid trellis Engram geometry, dtype, or byte span")
+                        pair.append(FileSource(path, offset, nbytes))
+                    sources[layer] = tuple(pair)
+                    inputs[layer] = EngramInputs.allocate(tokens, device, timings=timings, interval=index,
+                                                          row_width=128)
+                else:
+                    pair = []
+                    for suffix, columns, dtype in (("weight", 256, "F8_E4M3"), ("scale", 8, "F8_E8M0")):
+                        name = f"layers.{layer}.engram.embed.{suffix}"
+                        metadata = manifest.tensors[name]
+                        if metadata.shape != (rows, columns) or metadata.dtype != dtype:
+                            raise ValueError(f"{name}: invalid Engram table geometry or dtype")
+                        pair.append(FileSource(manifest.snapshot / metadata.shard, metadata.offset, rows * columns))
+                    sources[layer] = tuple(pair)
+                    inputs[layer] = EngramInputs.allocate(tokens, device, timings=timings, interval=index)
                 mailboxes[layer] = host_allocator(f"engram_{layer}_requests", (tokens * 24 + 1,), torch.int64)
                 mailboxes[layer].host_view.zero_()
             stage.update(f"{sum(source.nbytes for pair in sources.values() for source in pair) / (1 << 30):.1f} GiB in checkpoint spans")
         columns = persistent_copy(torch.tensor([head * 256 + column for head in range(shard.rank, 24, shard.world_size)
                                 for column in range(256)], dtype=torch.int64, device=device))
-        return cls(geometry, tuple(token_map), sources, inputs, mailboxes, sequence, shard, row_mapping, columns)
-
-    @cached_property
-    def device_token_map(self):
-        device = next(iter(self.inputs.values())).hashes.device
-        return persistent_copy(torch.tensor(self.token_map, dtype=torch.int64, device=device))
+        return cls(geometry, tuple(token_map), sources, inputs, mailboxes, sequence, shard, row_mapping, columns,
+                   trellis=config.trellismx)
 
     def buffers(self):
         return {**{name: tensor for layer, inputs in self.inputs.items() for name, tensor in inputs.buffers(layer).items()},
@@ -97,7 +130,8 @@ class Tables:
                             {"path": str(source.path), "offset": source.offset + first * row_bytes,
                              "nbytes": (last - first) * row_bytes}
                             for first, last in partition.source_rows], "row_bytes": row_bytes}
-                        for source, row_bytes in zip(self.sources[layer], (256, 8), strict=True)],
+                        for source, row_bytes in zip(self.sources[layer],
+                                                      (128, 8) if self.trellis else (256, 8), strict=True)],
              "heads": 24, "weights": f"engram_{layer}_weights", "scales": f"engram_{layer}_scales",
              "hashes": f"engram_{layer}_hashes", "event": f"engram_{layer}_ready",
              "request": f"engram_{layer}_requests"}
@@ -113,7 +147,8 @@ class Tables:
         tables = []
         for ordinal, layer in enumerate(self.geometry.layer_ids):
             table = dict(layer=layer, rows=self.geometry.num_embeddings[ordinal],
-                embedding_width=256, scale_block=32, encoding="FP8_E4M3_E8M0",
+                embedding_width=256, scale_block=32,
+                encoding="TRELLIS_K4_E4M3_E8M0" if self.trellis else "FP8_E4M3_E8M0",
                 weight_buffer=f"engram_{layer}_weights", scale_buffer=f"engram_{layer}_scales",
                 hash_buffer=f"engram_{layer}_hashes", ready_event=f"engram_{layer}_ready",
                 request_buffer=f"engram_{layer}_requests")
@@ -125,7 +160,8 @@ class Tables:
                 for head in partition.heads:
                     offsets[head] = first + partition.row_mapping[head][2]
                 planes = dict(rank=rank, first_row=first, rows=partition.rows)
-                for name, source, width in zip(("weights", "scales"), self.sources[layer], (256, 8), strict=True):
+                for name, source, width in zip(("weights", "scales"), self.sources[layer],
+                                               (128, 8) if self.trellis else (256, 8), strict=True):
                     planes[name] = [dict(path=str(source.path), offset=source.offset + start * width,
                                          nbytes=(end - start) * width)
                                     for start, end in partition.source_rows]
@@ -217,9 +253,11 @@ class PreparedEngram:
                 (self.projected, (tokens, 25600), torch.bfloat16)):
             if tensor.shape != shape or tensor.dtype != dtype or tensor.device != device or not tensor.is_contiguous():
                 raise ValueError("Engram scratch must match the contiguous lookup and projection geometry")
+        ordinal = tables.geometry.layer_ids.index(layer)
         self.lookup = PreparedEngramLookup(tables.inputs[layer], self.gathered, metadata.live_counts[:1],
             layer=layer, token_map=tables.token_map, geometry=tables.geometry,
-            session=session, name=name + ".lookup", runtime=tables.readiness_runtime, coordinator=coordinator).functional(session=session)
+            session=session, name=name + ".lookup", runtime=tables.readiness_runtime, coordinator=coordinator,
+            trellis=tables.trellis, table_rows=tables.geometry.num_embeddings[ordinal]).functional(session=session)
         self.projection = QuantizedProjection(self.local, weights["projection"], self.partial,
             session=session, name=name + ".projection", workspace=workspace, activation_mode="auto",
             examples=examples, example_role="engram.projection").functional(session=session)
