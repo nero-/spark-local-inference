@@ -27,6 +27,7 @@ from ignition.components.sampling import AdmissionBuffers, DeviceRequestState
 from ignition.components.state_transfer import StateCommands
 from ignition.preparation.capture import capture_forwards
 from ignition.preparation.rebuild_manifest import declare_weights
+from .config import ModelConfig
 from .contract import prepare as prepare_contract, PATCH_CAPACITIES, INPUT_VOCABULARY
 from ignition.components.deepseek_vision import (PreparedVision, VisionInputs, VisionScratch,
     PrefillVisionInputs, PreparedVisionGeneration, VisionState)
@@ -108,6 +109,10 @@ class PreparationConfig:
     roce_chain: bool = False
     context: int = 1048576
     prefill_chunk_size: int = 4096
+    # Original checkpoint directory for directly-read sidecars (TrellisMX).
+    # Multi-host preparation may stage tensors into a transfer cache; the
+    # sidecar loader reads the node's own copy from this path instead.
+    checkpoint_root: str | None = None
     max_active: int = 32
     minimum_pages: int = 8
     # An explicit cache capacity makes memory comparisons independent of automatic sizing.
@@ -174,11 +179,11 @@ class PreparationConfig:
         if type(self.stream_overlap) is not bool:
             raise TypeError("stream_overlap must be a boolean")
         placements = tuple(zip(self.hosts or ("",) * len(self.devices), self.devices))
-        if (not isinstance(self.devices, tuple) or len(self.devices) not in (3, 4, 6)
+        if (not isinstance(self.devices, tuple) or len(self.devices) not in (2, 3, 4, 6)
                 or len(set(placements)) != len(self.devices)
                 or self.hosts is not None and (not isinstance(self.hosts, tuple) or len(self.hosts) != len(self.devices))
                 or any(type(d) is not int or d < 0 for d in self.devices)):
-            raise ValueError("DeepSeek V4.1 Flash preparation requires three, four, or six distinct GPUs")
+            raise ValueError("DeepSeek V4.1 Flash preparation requires two, three, four, or six distinct GPUs")
         from ignition.planning import host_shape_error
 
         error = host_shape_error(self.roce_ring, self.roce_chain, None if self.hosts is None else len(self.hosts))
@@ -340,13 +345,29 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage=N
     with phase(progress, "Inspect checkpoint"):
         manifest = inspect_indexed_checkpoint(snapshot)
     metadata_path = manifest.metadata_path
+    if ModelConfig.load(metadata_path).trellismx:
+        if len(config.devices) != 2:
+            raise ValueError("the TrellisMX K2-Mix pack is split for exactly two tensor-parallel ranks")
+        vendor = Path(__file__).resolve().parents[3] / "vendor"
+        if not (vendor / "ds41_trellismx").is_dir() or not (vendor / "ds41_kern" / "b12x").is_dir():
+            raise ValueError(
+                "TrellisMX checkpoints require vendor/ds41_trellismx and "
+                "vendor/ds41_kern/b12x on every preparing host")
+        root = None if config.checkpoint_root is None else Path(config.checkpoint_root)
+        if root is None or not (root / "trellismx").is_dir() or not (root / "engram").is_dir():
+            raise ValueError(
+                f"TrellisMX sidecars and Engram tables are missing at {root}; "
+                "rank zero must export a directory with trellismx/ and engram/, and "
+                "every preparing host needs that pack at rank zero's absolute path")
     with core_storage.transient():
         weights = ModelWeights.load(manifest, device, shard=shard, progress=progress, dspark=config.dspark,
                                     confidence=config.draft_tokens > 0,
                                     expert_scale_compression=config.expert_scale_compression,
                                     draft_head_quantization=config.draft_head_quantization,
                                     markov_head_quantization=config.markov_head_quantization,
-                                    vocabulary_parallel_sampling=config.vocabulary_parallel_sampling)
+                                    vocabulary_parallel_sampling=config.vocabulary_parallel_sampling,
+                                    prefill_chunk_tokens=config.prefill_chunk_size,
+                                    trellis_root=config.checkpoint_root)
         release_unused()
     if progress is not None:
         progress("Target head: BF16 checkpoint weights with FP32 accumulation and logits")
@@ -357,7 +378,8 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage=N
     sequence = torch.zeros(1, dtype=torch.int64, device=device)
     frame = torch.zeros(1, dtype=torch.int32, device=device)
     tables = Tables.prepare(manifest, weights.config, tokens=max(config.prefill_chunk_size, config.decode_tokens),
-        device=device, sequence=sequence, frame=frame, host_allocator=core_storage.host_allocate, progress=progress, shard=shard)
+        device=device, sequence=sequence, frame=frame, host_allocator=core_storage.host_allocate, progress=progress,
+        shard=shard, root=config.checkpoint_root)
     with phase(progress, "Allocate model state and collectives"):
         layout = continuation_layout(weights.config, dspark=config.dspark)
         snapshots = layout.snapshot_capacity(config.snapshot_budget_bytes)
