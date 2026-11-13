@@ -98,6 +98,7 @@ class Tables:
                              "nbytes": (last - first) * row_bytes}
                             for first, last in partition.source_rows], "row_bytes": row_bytes}
                         for source, row_bytes in zip(self.sources[layer], (256, 8), strict=True)],
+             "layer": layer,
              "heads": 24, "weights": f"engram_{layer}_weights", "scales": f"engram_{layer}_scales",
              "hashes": f"engram_{layer}_hashes", "event": f"engram_{layer}_ready",
              "request": f"engram_{layer}_requests"}

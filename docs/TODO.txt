@@ -223,6 +223,20 @@
 [ ] Validate embedding readiness timestamps in full Qwen3.8 PLE serving and
     cross-node RoCEnante TP cores for Qwen3.8 and DeepSeek V4.1.
 
+[ ] Measure prefill read-ahead on DeepSeek V4.1 disk Engram serving: cold
+    250k/500k prompt throughput, GPU utilisation, and
+    `flare_engram_table_prediction_mismatches_total` with
+    `--embedding-table-prefetch` against `--no-embedding-table-prefetch`, at
+    16 GiB and 64 GiB row caches, on XFS and on btrfs. Unmeasured on DeepSeek
+    hardware. A host emulation with the real reader, cache, and ring at
+    DeepSeek's table shape on a GB10's NVMe, with the graph replaced by a fixed
+    455 ms per 8192-token chunk, measured 10.8k against 15.1k tokens/s and 60%
+    against 84% GPU busy for a cold 256k prompt with a 16 GiB cache. The
+    remaining stall is the hit path of the real gather (about 85 ms per chunk:
+    sort, cache probe, copy) and the first chunk's cold read. Export of the
+    GB10 Qwen package needs local-inference-lab/flashinfer branch
+    fix/direct-sfb-rank until the pin moves past it.
+
 [ ] Measure cross-host rank handoff polling and completion yielding: CPU time,
     request p99, and complete-round latency under active and idle workloads.
     See helios/src/execution/parallel.rs and performance-work.md.
