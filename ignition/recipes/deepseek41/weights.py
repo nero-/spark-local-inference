@@ -55,6 +55,42 @@ class TrellisExpertLayer:
 
 
 @dataclass(frozen=True)
+class TrellisExpertLayer:
+    """One decoder layer's routed experts on the TrellisMX P8 driver.
+
+    The driver owns the rank's trellis streams, CSF scale views, coupled
+    boundary vectors and per-shape compiled kernels. It executes inside the
+    captured forward and returns this rank's BF16 partial.
+    """
+
+    driver: object
+    hidden: int
+    intermediate: int
+    experts: int
+
+    @property
+    def weights(self):
+        """Stored expert payload views, one pair per width group and layer.
+
+        Declaring these keeps the trellis streams in per-layer weight groups
+        instead of one ~72 GB opaque initial-state object.
+        """
+        views = []
+        groups = getattr(self.driver, "groups", None)
+        if groups:
+            for entry in groups:
+                child = entry[0] if isinstance(entry, tuple) else entry
+                if not hasattr(child, "w13_stream") or not hasattr(child, "w2_stream"):
+                    raise ValueError("TrellisMX mixed group does not expose w13_stream/w2_stream")
+                views.append(child.w13_stream)
+                views.append(child.w2_stream)
+        else:
+            views.append(self.driver.w13_stream)
+            views.append(self.driver.w2_stream)
+        return tuple(views)
+
+
+@dataclass(frozen=True)
 class ExpertWeights:
     router: torch.Tensor
     correction: torch.Tensor

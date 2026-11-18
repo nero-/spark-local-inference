@@ -5,8 +5,10 @@
 import json
 
 import pytest
+import torch
 
-from ignition.recipes import _stored_bytes
+from ignition.recipes import _replacement, _stored_bytes, _supporting
+from ignition.recipes.deepseek41.decoder import PreparedTrellisExperts
 from ignition.recipes.deepseek41.engram import _tensor_span
 
 
@@ -61,3 +63,36 @@ def test_tensor_span_exposes_a_row_width_mismatch(tmp_path):
     _write(short, 256)
     offset, nbytes, shape, dtype = _tensor_span(short, "layers.1.engram.embed.trellis")
     assert nbytes == 256 and shape == (4, 128)  # caller rejects nbytes != rows*width
+
+
+def test_supporting_selects_the_trellismx_checkpoint_by_quant_method(tmp_path):
+    trellis = tmp_path / "trellis.json"
+    trellis.write_text(json.dumps({"architectures": ["DeepseekV41ForCausalLM"],
+                                   "quantization_config": {"quant_method": "ds41_trellismx"}}))
+    official = tmp_path / "official.json"
+    official.write_text(json.dumps({"architectures": ["DeepseekV41ForCausalLM"],
+                                    "quantization_config": {"quant_method": "fp8"}}))
+
+    _, trained = _supporting(trellis, "trellis")
+    _, stock = _supporting(official, "official")
+    assert "trellismx" in trained.alias and "trellismx" not in stock.alias
+    # The pack's per-rank footprint must not shrink with a rank-0-only subset.
+    kept = _replacement(trained, "dir", "rev", trained.stored_bytes // 2, scale=False)
+    assert kept.device_bytes == trained.device_bytes
+
+
+def test_trellis_experts_follow_the_functional_protocol():
+    source = torch.zeros(2, 16, dtype=torch.bfloat16)
+    ids = torch.zeros(2, 6, dtype=torch.int32)
+    weights = torch.ones(2, 6)
+    output = torch.zeros(2, 16, dtype=torch.bfloat16)
+
+    def driver(x, topk_weights, topk_ids):
+        assert x.dtype is torch.bfloat16 and topk_weights.dtype is torch.float32
+        assert topk_ids.dtype is torch.int32
+        return x * 0.5
+
+    experts = PreparedTrellisExperts(source, ids, weights, output, driver=driver, name="test")
+    assert experts.functional(session=None) is experts
+    result = experts(source, ids, weights, router_logits=None, selected_logits=None, image_mask=None)
+    assert result.shape == (2, 16) and torch.equal(result, source * 0.5)

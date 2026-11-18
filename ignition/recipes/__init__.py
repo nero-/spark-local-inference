@@ -152,13 +152,20 @@ def _unsupported(reason: str) -> UsageError:
 
 def _supporting(config_path: Path, source: str) -> tuple[Recipe, Checkpoint]:
     try:
-        architectures = json.loads(config_path.read_text())["architectures"]
-    except (OSError, ValueError, KeyError, TypeError) as error:
+        config = json.loads(config_path.read_text())
+        architectures = config["architectures"]
+        trellis = config.get("quantization_config", {}).get("quant_method") == "ds41_trellismx"
+    except (OSError, ValueError, KeyError, TypeError, AttributeError) as error:
         raise _unsupported(f"{source} has no readable config.json architecture") from error
     for recipe in recipes():
         for checkpoint in recipe.checkpoints:
-            if isinstance(architectures, list) and checkpoint.architecture in architectures:
-                return recipe, checkpoint
+            if not (isinstance(architectures, list) and checkpoint.architecture in architectures):
+                continue
+            # The DS41 TrellisMX pack shares the official architecture but is a
+            # distinct two-rank checkpoint with its own footprint declaration.
+            if trellis != ("trellismx" in checkpoint.alias):
+                continue
+            return recipe, checkpoint
     raise _unsupported(f"no recipe supports architecture {architectures!r} in {source}")
 
 
@@ -187,15 +194,16 @@ def _stored_bytes(index_path: Path, source: str) -> int:
     return stored
 
 
-def _replacement(qualified: Checkpoint, repository: str, revision: str, stored_bytes: int) -> Checkpoint:
+def _replacement(qualified: Checkpoint, repository: str, revision: str, stored_bytes: int,
+                 *, scale: bool = True) -> Checkpoint:
     """Describe another checkpoint of a recipe's model, scaling placement from the qualified checkpoint."""
-    scale = stored_bytes / qualified.stored_bytes
+    ratio = stored_bytes / qualified.stored_bytes if scale else 1.0
     return replace(qualified, repository=repository, revision=revision, stored_bytes=stored_bytes,
-                   device_bytes=round(qualified.device_bytes * scale),
-                   scale_compressed_device_bytes={encoding: round(size * scale)
+                   device_bytes=round(qualified.device_bytes * ratio),
+                   scale_compressed_device_bytes={encoding: round(size * ratio)
                        for encoding, size in qualified.scale_compressed_device_bytes.items()},
-                   mapped_host_bytes=round(qualified.mapped_host_bytes * scale),
-                   expansion_bytes=round(qualified.expansion_bytes * scale))
+                   mapped_host_bytes=round(qualified.mapped_host_bytes * ratio),
+                   expansion_bytes=round(qualified.expansion_bytes * ratio))
 
 
 def _hub_metadata(repository: str, revision: str | None, hub_cache: Path | None) -> tuple[Path, Path]:
@@ -240,7 +248,10 @@ def resolve(model: str, hub_cache: Path | None = None) -> ResolvedModel:
         stored = (_csf_stored_bytes(container, directory) if container is not None else
                   _stored_bytes(index, str(directory)) if index.exists() else
                   single.stat().st_size if single.is_file() else qualified.stored_bytes)
-        return ResolvedModel(recipe, _replacement(qualified, str(directory), revision, stored), directory)
+        # A TrellisMX pack's per-rank footprint is fixed by the pack, not by how
+        # many sidecar files this host happens to hold (rank 0 vs rank 1 subsets).
+        return ResolvedModel(recipe, _replacement(qualified, str(directory), revision, stored,
+                                                  scale="trellismx" not in qualified.alias), directory)
     repository, _, revision = model.partition("@")
     if "/" not in repository:
         for recipe in recipes():
@@ -263,5 +274,6 @@ def resolve(model: str, hub_cache: Path | None = None) -> ResolvedModel:
     config_path, index_path = _hub_metadata(repository, revision or None, hub_cache)
     recipe, qualified = _supporting(config_path, model)
     # The hub cache stores each file under its commit hash.
-    replacement = _replacement(qualified, repository, config_path.parent.name, _stored_bytes(index_path, model))
+    replacement = _replacement(qualified, repository, config_path.parent.name, _stored_bytes(index_path, model),
+                               scale="trellismx" not in qualified.alias)
     return ResolvedModel(recipe, replacement)

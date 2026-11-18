@@ -27,6 +27,7 @@ from ignition.components.sampling import AdmissionBuffers, DeviceRequestState
 from ignition.components.state_transfer import StateCommands
 from ignition.preparation.capture import capture_forwards
 from ignition.preparation.rebuild_manifest import declare_weights
+from .config import ModelConfig
 from .contract import prepare as prepare_contract, PATCH_CAPACITIES, INPUT_VOCABULARY
 from ignition.components.deepseek_vision import (PreparedVision, VisionInputs, VisionScratch,
     PrefillVisionInputs, PreparedVisionGeneration, VisionState)
@@ -359,6 +360,20 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage=N
     with phase(progress, "Inspect checkpoint"):
         manifest = inspect_indexed_checkpoint(snapshot)
     metadata_path = manifest.metadata_path
+    if ModelConfig.load(metadata_path).trellismx:
+        if len(config.devices) != 2:
+            raise ValueError("the TrellisMX K2-Mix pack is split for exactly two tensor-parallel ranks")
+        vendor = Path(__file__).resolve().parents[3] / "vendor"
+        if not (vendor / "ds41_trellismx").is_dir() or not (vendor / "ds41_kern" / "b12x").is_dir():
+            raise ValueError(
+                "TrellisMX checkpoints require vendor/ds41_trellismx and "
+                "vendor/ds41_kern/b12x on every preparing host")
+        root = None if config.checkpoint_root is None else Path(config.checkpoint_root)
+        if root is None or not (root / "trellismx").is_dir() or not (root / "engram").is_dir():
+            raise ValueError(
+                f"TrellisMX sidecars and Engram tables are missing at {root}; "
+                "rank zero must export a directory with trellismx/ and engram/, and "
+                "every preparing host needs that pack at rank zero's absolute path")
     with core_storage.transient():
         weights = ModelWeights.load(manifest, device, shard=shard, progress=progress, dspark=config.dspark,
                                     confidence=config.draft_tokens > 0,

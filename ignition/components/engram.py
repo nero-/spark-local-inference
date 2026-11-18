@@ -98,7 +98,7 @@ class PreparedEngramLookup:
                                      shard_start=0, shard_end=self.table_rows, rows=self.table_rows,
                                      tables={"lut": self.lut, "perm": self.permutation},
                                      prepared_tokens=self.hashes.shape[0], compact_rows=True)
-            torch.cuda.synchronize(output.device)
+            torch.cuda.current_stream(output.device).synchronize()
             return
         self.plan = engram.plan(engram.Caps(device=output.device, max_tokens=tokens,
             max_seqs=tokens, max_requests=tokens, vocab_size=len(token_map), layer_id=layer,
