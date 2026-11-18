@@ -461,6 +461,8 @@ explicit flags take precedence.
 | `--autotune-effort off\|default\|audit` | Kernel search effort. Off uses heuristics without races; default races the candidates that pass each kernel family's performance exclusions; audit lifts those exclusions and races every legal candidate, to check that the default search prunes no winners. Overrides `[preparation] autotune_effort`. | Default |
 | `--joint-tuning` | Jointly select DeepSeek V4.1 QKV projection, query normalization, and query expansion plans by timing complete prepared layers across every prefill, decode, packed verification, and draft shape. Requires MXFP8 query normalization and autotuning enabled. Command line only. | off |
 | `--shard-hyperconnections` | Partition Qwen3.8 Flash target and MTP hyperconnection bottlenecks across TP ranks and all-reduce BF16 gate logits before sigmoid. Requires TP2 or TP4. Command line only; changing it requires re-export. | off (replicated) |
+| `--row-shard-prefill` | Replace each DeepSeek V4.1 prefill tensor-parallel all-reduce with a reduce-scatter, run the hyperconnection on the rank's contiguous row shard, and gather the normalized branch input back to every rank. The collective pair preserves the pipelined two-shot reduction's arithmetic; whole-decoder numerical equivalence remains unqualified. Preparation requires the runtime's ABI 11 or later row-shard surfaces; the proxy pinned in this tree records ABI 14. Requires TP2 or more; three ranks and SM103 are refused, and a layer whose row count or pipe capacity does not fit keeps the all-reduce path. Command line only; changing it requires re-export. | off |
+| `--row-shard-attention` | Also run DeepSeek V4.1 prefill attention on the rank's row shard: every rank loads all 64 attention heads and all 8 output groups for the layers a prepared prefill runs on the shard, which the plan charges as resident weights (17 layers, 2.06 GB per rank at TP4 by default; 37, 4.48 GB with `--prompt-logprobs`; 35, 4.24 GB for scored `--mtp-only`), gathers the KV latent and the compressed-latent projections so its caches hold every row, and needs no attention reduction. Changes reduction rounding relative to the all-reduce path; see the [DeepSeek V4.1 preparation guide](model-preparation.md#deepseek-v41-flash). Requires `--row-shard-prefill`; a layer whose gathers do not fit keeps the partitioned path. Command line only; changing it requires re-export. | off |
 | `--collective-ladder PATH` | JSON file of final joint collective geometries and runtime profiles. Required when the resolved collective tuning policy is `runtime`; rejected with `static`. See [offline ladders](../ignition/preparation/ladders/README.md). | None |
 | `--collective-tuning static\|runtime` | Static autotunes collectives during preparation; runtime uses the required ladder file for final compiled geometry and captures runtime submode/active-CTA selection for eligible BF16 PCIe reductions. Overrides `[preparation] collective_tuning`, then the recipe declaration. | Static |
 | `--lock-gpu-clocks` | Lock each tuning GPU at its maximum supported graphics frequency during b12x and Inductor autotuning, then reset driver clock defaults. Frozen warmup, capture, and serving remain unlocked. Requires root or noninteractive sudo access to `nvidia-smi`. Command line only; inactive with `--autotune-effort off`. | off |
@@ -748,6 +750,7 @@ Help exits with status 0; usage errors go to stderr with status 2. Its options a
 | `--prefix-cache-disk-limit SIZE` | Disk retention limit, such as `100G`; `0` disables | `[prefix_cache] disk_limit`, otherwise 10% of free space |
 | `--prefix-cache-drain-on-shutdown[=DURATION\|on\|off]` | Drain host-memory records to local disk at shutdown, optionally bounded by a duration such as `90s` or `2m`; the bare flag means `on`, and a value requires `=` | `[prefix_cache] drain_on_shutdown`, otherwise `off` |
 | `--prefix-cache-max-age DURATION\|off` | Expire host records by time since last use | `[prefix_cache] max_age`, otherwise `off` |
+| `--embedding-table-prefetch` / `--no-embedding-table-prefetch` | Predict the rows coming steps will request and read them into the row cache while earlier steps replay, reading prompts ahead of prefill | Enabled for disk tables with a row cache |
 
 The table omits flags specified elsewhere: `--config`, the scheduler flags above,
 the multi-host flags in [section 2](#2-commands), the
@@ -762,10 +765,14 @@ favor shorter prefixes. Confidence observations and token acceptance remain
 unchanged. This serving option uses the core's captured graphs and does not enable
 adaptive verification when fixed-width selection is configured.
 
-`--embedding-table-workers 1|2|4|8` controls Windows disk-reader workers.
-Workers share 128 I/O slots and 8 MiB of direct-read staging per embedding table.
-Windows defaults to four workers; other platforms default to one. Explicit worker
-counts override the default. Large gathers use scoped helper threads, whose startup
+`--embedding-table-workers 1|2|4|8` sets the disk-reader workers per embedding
+table, each submitting through its own I/O ring. Workers share one queue and
+staging budget per table: 128 I/O slots and 8 MiB of direct-read staging on
+Windows, and on Linux the io_uring depth that landed (256 slots and 16 MiB unless
+the locked-memory limit lowered it). More workers add submitters without adding
+reads in flight, which matters for drives that only reach their random-read rate
+with many submitting threads. Windows defaults to four workers; Linux retains one.
+Explicit worker counts override the default. Large gathers use scoped helper threads, whose startup
 cost is included in gather latency. Small gathers stay on the delivery thread.
 Worker phase counters sum overlapping worker intervals and must not be subtracted
 from elapsed gather time. RAM storage rejects this disk-only option.
@@ -795,6 +802,55 @@ budget. This option needs no re-export and requires disk table storage;
 RAM table storage holds both planes in host memory. The metric
 `flare_engram_resident_scale_bytes` reports the scale allocation separately from
 the row cache.
+
+`--embedding-table-prefetch` asks each table's reader thread to read rows into the
+row cache before the graph that requests them runs. A graph publishes its row ids
+only once it starts, so without prefetch every row miss is read while the GPU
+waits, and a cold prompt alternates between disk and GPU work instead of
+overlapping them. A prefill lane's prompt is known at admission, so its rows are
+read ahead of the launching chunk, continuing from where the previous step left
+off, up to a quarter of the table's row cache or the advisory queue's bound of
+about a million rows. Prompts prefilled together share that bound. A decode,
+speculative, or mixed lane hands over its pending token only when no step is in
+flight: a pipelined step takes its input from the previous step's device output,
+which the host has not seen yet. While a submitted step's graph has not yet published its ids, its reader
+thread spends that wait reading ahead in batches of 4096 rows, so a step whose ids
+appear waits at most for the batch in progress. A row read ahead is admitted to
+the cache however rarely it was requested before, and it is protected from
+eviction until a gather uses it or one full turnover of cache operations passes.
+
+The prediction uses only the addressing the package declares (`EngramHash.method`,
+`orders`, `multipliers`, `primes`, `offsets`, and the `Engram` `token_map`,
+`pad_token_id` and `compressed_vocabulary`), so no recipe or model identity reaches
+the runtime. It is advisory: the captured graph remains the authority, it publishes
+the ids its own lookup consumes, and the real gather reads them whether or not the
+prediction was right. Prefetch never allocates GPU memory, never enters a graph,
+and never takes a staging frame; it fills the same bounded host row cache that a
+request gather warms. Batches that find the reader's advisory queue full are
+discarded and offered again with the next step. The option is refused for
+`--embedding-table-storage ram`, and no prefetching happens when the row cache is
+disabled. Read-ahead depth follows the cache size: a cache smaller than one prefill
+chunk's rows can only warm part of each chunk. Drafts beyond a decode lane's pending
+token are produced inside the graph, so those rows are requested the ordinary way.
+
+`flare_engram_prefetch_submissions_total` and
+`flare_engram_prefetch_dropped_submissions_total` count the steps whose predicted
+rows were all queued and the steps for which the queue refused some;
+`flare_engram_prefetch_enabled` separates a disabled prefetcher from one that is
+keeping up. Per table, `flare_engram_table_prefetch_rows_total`,
+`..._rows_loaded_total`, `..._rows_dropped_total`, and `..._errors_total` report the
+warming work, the `..._queue_batches` gauge its depth, and
+`flare_engram_table_prediction_mismatches_total` counts the steps for which a row
+the host predicted was not among the ids the graph published. Each step checks one
+batch of each prefill lane's own positions and every decode lane's pending token;
+rows of graph-produced drafts are never predicted, so they cannot cause a mismatch.
+Any nonzero value means the host derivation disagrees with the graph, which is a
+defect and never a serving fault.
+`flare_engram_table_disk_queue_depth` and `..._queue_depth_requested` report the
+io_uring depth that actually landed after the locked-memory clamp and halving
+ladder, `..._alignment_bytes` the smallest per-file direct-I/O fragment floor
+`statx` reported, `..._uring_flags` the accepted `IORING_SETUP_*` bits, and
+`..._fixed_files` whether registered descriptors are in use.
 
 Ignition exports each recipe's canonical model name as its default serving
 alias, such as `DeepSeek-V4.1-Flash`. Checkpoint selectors such as

@@ -1049,6 +1049,16 @@ struct Worker<'a> {
     preparing_image: Option<RequestHandle>,
     image_preparation_cursor: usize,
     prefill_started: VecDeque<(crate::cache::Fence, std::time::Instant, u64)>,
+    /// Reused predicted-row buffer, so the submission path allocates nothing.
+    prefetch_scratch: Vec<i64>,
+    /// Per table, the rows predicted for the step being submitted, left for the
+    /// reader threads to check against what the graph publishes.
+    prefetch_expected: Vec<Vec<i64>>,
+    /// Per request slot, the prompt position through which embedding rows were
+    /// handed to the readers ahead of the graph, for the request occupying it.
+    read_ahead: Vec<Option<(RequestHandle, usize)>>,
+    /// Per table, the read-ahead tokens the step's prefill lanes have left to share.
+    read_ahead_budget: Vec<usize>,
 }
 
 impl<'a> Worker<'a> {
@@ -1082,6 +1092,10 @@ impl<'a> Worker<'a> {
             inputs: None,
             prefill_rate: flare_selene::INITIAL_PREFILL_RATE,
             prefill_started: VecDeque::new(),
+            prefetch_scratch: Vec::new(),
+            prefetch_expected: Vec::new(),
+            read_ahead: (0..config.limits.max_active).map(|_| None).collect(),
+            read_ahead_budget: Vec::new(),
             image_preparation: None,
             preparing_image: None,
             image_preparation_cursor: 0,
@@ -2155,6 +2169,123 @@ impl<'a> Worker<'a> {
         Ok(())
     }
 
+    /// Hand embedding rows to the reader threads ahead of the graphs that request
+    /// them, so disk reads overlap replay instead of gating it.
+    ///
+    /// A table's ids are published by the graph itself, so without this its rows
+    /// are read only once the step is already running and every row miss stalls
+    /// the GPU. Prompt positions are host-known from admission, so a prefill lane
+    /// is read ahead past the launching chunk, from where the previous step left
+    /// off, within a read-ahead budget per table that the step's prefill lanes
+    /// share in lane order, and the readers keep the disk busy through each
+    /// step's replay. A decode, speculative, or mixed lane hands over its pending
+    /// token, but only when no step is in flight: a pipelined step's input comes
+    /// from the previous step's device output. Drafts beyond it are not
+    /// predicted: copied-token proposals arrive as host-chosen ids from another
+    /// source and MTP drafts are produced inside the graph, so their rows are
+    /// requested the ordinary way.
+    ///
+    /// The graph stays the authority: it publishes the ids its own lookup consumes
+    /// and the real gather still reads them. A wrong prediction wastes disk
+    /// bandwidth and nothing else, and `flare_engram_prediction_mismatches_total`
+    /// counts steps whose predicted rows the graph did not publish. A prefill lane
+    /// contributes one batch of its own positions to that check, which suffices
+    /// for a systematic derivation error and keeps the scheduler thread from
+    /// sorting a whole chunk.
+    fn prefetch_rows(&mut self, executor: &RankExecutor, step: &ScheduledPlan, sequence: u64) {
+        let Some(binding) = executor.manifest().engram.as_ref() else {
+            return;
+        };
+        let shared = &binding.shared;
+        if !crate::engram::consumes(step.kind) || !shared.prefetching() {
+            return;
+        }
+        let tables = shared.index.tables.len();
+        self.prefetch_expected.resize_with(tables, Vec::new);
+        // A decode lane's input is host-known only once every earlier step's
+        // completion has been observed. A step submitted while another is in
+        // flight takes its input from that step's device output, and the host's
+        // pending token is still the previous step's: predicting from it reads
+        // the rows the previous step already used. Prompt positions are fixed at
+        // admission, so prefill lanes are predictable either way.
+        let decode_known = executor.outstanding() == 0;
+        // Each table's read-ahead bound covers every prompt in the step together:
+        // several requests prefilling at once must not each pin a full budget.
+        self.read_ahead_budget.clear();
+        self.read_ahead_budget
+            .extend((0..tables).map(|table| shared.read_ahead_tokens(table)));
+        let mut refused = false;
+        for (row, lane) in step.lanes.iter().enumerate() {
+            let slot = lane.request.slot as usize;
+            let Some(Some(admission)) = self.admissions.get(slot) else {
+                continue;
+            };
+            let Ok(live) = self.scheduler.request(lane.request) else {
+                continue;
+            };
+            let tokens = live.tokens();
+            let excluded = |position| admission.data.is_image_position(position);
+            let scratch = &mut self.prefetch_scratch;
+            if !step.lane_kind(row).is_prefill() {
+                if !decode_known {
+                    continue;
+                }
+                let first = live.consumed_tokens as usize;
+                for table in 0..tables {
+                    scratch.clear();
+                    shared.predict_rows(table, tokens, first, first + 1, excluded, scratch);
+                    self.prefetch_expected[table].extend_from_slice(scratch);
+                    refused |= !scratch.is_empty() && !shared.prefetch(table, scratch);
+                }
+                continue;
+            }
+            let first = lane.start_position as usize;
+            let launched = (first + lane.tokens).min(tokens.len());
+            let progress = match self.read_ahead.get(slot) {
+                Some(Some((request, end))) if *request == lane.request => (*end).max(first),
+                _ => first,
+            };
+            let mut reached = usize::MAX;
+            for table in 0..tables {
+                let batch = shared.batch_tokens(table);
+                shared.predict_rows(
+                    table,
+                    tokens,
+                    first,
+                    (first + batch).min(launched),
+                    excluded,
+                    &mut self.prefetch_expected[table],
+                );
+                // Never stop short of the launching chunk: its rows are needed now.
+                let share = self.read_ahead_budget[table];
+                let limit = (first + share).max(launched).min(tokens.len());
+                let mut position = progress;
+                while position < limit {
+                    let end = (position + batch).min(limit);
+                    scratch.clear();
+                    shared.predict_rows(table, tokens, position, end, excluded, scratch);
+                    if !scratch.is_empty() && !shared.prefetch(table, scratch) {
+                        refused = true;
+                        break;
+                    }
+                    position = end;
+                }
+                reached = reached.min(position);
+                // Rows queued in earlier steps still occupy the cache until used,
+                // so the lane's whole extent past the graph's position counts.
+                self.read_ahead_budget[table] = share.saturating_sub(position - first);
+            }
+            if let Some(entry) = self.read_ahead.get_mut(slot) {
+                *entry = Some((lane.request, reached));
+            }
+        }
+        for (table, expected) in self.prefetch_expected.iter_mut().enumerate() {
+            shared.expect(table, sequence, expected);
+            expected.clear();
+        }
+        shared.stats().record_submission(!refused);
+    }
+
     fn submit(&mut self, executor: &mut RankExecutor, step: &ScheduledPlan) -> Result<bool> {
         self.scheduler
             .advance_to(super::observation::monotonic_ns())?;
@@ -2180,6 +2311,12 @@ impl<'a> Worker<'a> {
         let fence = executor.next_fence()?;
         self.reserve_and_pack(step, fence)?;
         let feedback = self.scheduler.submitted_step(fence)?.requires_feedback;
+        // Publish the advisory gather before the launch: the reader threads start
+        // fetching while the previous step still replays, and the submission below
+        // registers the real request for the same rows. Taken before the upload
+        // list borrows the packed inputs, because the prediction reads scheduler
+        // state that the packing above has already committed.
+        self.prefetch_rows(executor, step, fence.0);
         if step
             .lanes
             .iter()
