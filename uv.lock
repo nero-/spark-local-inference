@@ -400,7 +400,7 @@ source = { directory = "heliopause" }
 [[package]]
 name = "flashinfer-python"
 version = "0.7.3"
-source = { git = "https://github.com/local-inference-lab/flashinfer.git?branch=main#2627c6c8ba2469292eaad2e037ee4708b74af3e7" }
+source = { git = "https://github.com/local-inference-lab/flashinfer.git?branch=main#39aab6039bc29b163de971667431655b12c8e4e5" }
 dependencies = [
     { name = "apache-tvm-ffi" },
     { name = "click" },
